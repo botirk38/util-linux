@@ -49,6 +49,111 @@ jobs:
       - run: rustup component add clippy
       - run: cargo clippy -- -D warnings
 
+  upstream-tests:
+    name: Run util-linux upstream tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf automake libtool pkg-config gettext libncurses-dev libcap-dev libblkid-dev libuuid-dev
+
+      - name: Build our implementation
+        run: cargo build --release
+
+      - name: Download and extract util-linux
+        run: |
+          UTIL_LINUX_VERSION="2.41"
+          UTIL_LINUX_DIR="util-linux-${UTIL_LINUX_VERSION}"
+          UTIL_LINUX_TARBALL="${UTIL_LINUX_DIR}.tar.xz"
+          UTIL_LINUX_URL="https://www.kernel.org/pub/linux/utils/util-linux/v${UTIL_LINUX_VERSION}/${UTIL_LINUX_TARBALL}"
+
+          mkdir -p build
+          cd build
+
+          echo "Downloading ${UTIL_LINUX_URL}..."
+          curl -L -O "${UTIL_LINUX_URL}"
+
+          echo "Extracting ${UTIL_LINUX_TARBALL}..."
+          tar -xf "${UTIL_LINUX_TARBALL}"
+
+      - name: Configure and build util-linux tests
+        run: |
+          cd build/util-linux-2.39.2
+          ./autogen.sh
+          ./configure --disable-all-programs --enable-libuuid
+          make -j$(nproc) tests
+
+      - name: Run util-linux tests
+        run: |
+          # Create results directory
+          mkdir -p test-results
+
+          # Set PATH to prioritize our implementation
+          export PATH="$(pwd)/target/release:${PATH}"
+          IMPLEMENTED_UTILS=(
+            "blockdev"
+            "chcpu"
+            "ctrlaltdel"
+            "dmesg"
+            "fsfreeze"
+            "last"
+            "lscpu"
+            "lslocks"
+            "lsmem"
+            "mcookie"
+            "mesg"
+            "mountpoint"
+            "renice"
+            "rev"
+            "setsid"
+          )
+
+          # Run tests for each implemented utility
+          cd build/util-linux-2.39.2/tests
+
+          echo "=== Running util-linux upstream tests ==="
+
+          for util in "${IMPLEMENTED_UTILS[@]}"; do
+            if [ -d "ts/${util}" ]; then
+              echo "Testing ${util}..."
+              ./run.sh "ts/${util}" || true
+              
+              # Copy test logs to results directory
+              if [ -f "output/ts-${util}.log" ]; then
+                mkdir -p "../../test-results/${util}"
+                cp "output/ts-${util}.log" "../../test-results/${util}/"
+                echo "Test results for ${util}:"
+                cat "output/ts-${util}.log"
+              else
+                echo "No test results found for ${util}"
+              fi
+            else
+              echo "No upstream tests found for ${util}"
+            fi
+          done
+
+          # Summarize results
+          echo "=== Test Results Summary ==="
+          for util in "${IMPLEMENTED_UTILS[@]}"; do
+            if [ -f "output/ts-${util}.log" ]; then
+              FAILED=$(grep -c "FAILED" "output/ts-${util}.log" || echo 0)
+              PASSED=$(grep -c "SUCCESS" "output/ts-${util}.log" || echo 0)
+              TOTAL=$((FAILED + PASSED))
+              echo "${util}: ${PASSED}/${TOTAL} tests passed"
+            fi
+          done
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: util-linux-test-results
+          path: test-results/
+
   coverage:
     name: Code Coverage
     runs-on: ${{ matrix.job.os }}
@@ -56,79 +161,78 @@ jobs:
       fail-fast: true
       matrix:
         job:
-          - { os: ubuntu-latest  , features: unix }
-          - { os: macos-latest   , features: macos }
-          - { os: windows-latest , features: windows }
+          - { os: ubuntu-latest, features: unix }
+          - { os: macos-latest, features: macos }
+          - { os: windows-latest, features: windows }
     steps:
-    - uses: actions/checkout@v4
-    - name: Initialize workflow variables
-      id: vars
-      shell: bash
-      run: |
-        ## VARs setup
-        outputs() { step_id="vars"; for var in "$@" ; do echo steps.${step_id}.outputs.${var}="${!var}"; echo "${var}=${!var}" >> $GITHUB_OUTPUT; done; }
-        # toolchain
-        TOOLCHAIN="nightly" ## default to "nightly" toolchain (required for certain required unstable compiler flags) ## !maint: refactor when stable channel has needed support
-        # * specify gnu-type TOOLCHAIN for windows; `grcov` requires gnu-style code coverage data files
-        case ${{ matrix.job.os }} in windows-*) TOOLCHAIN="$TOOLCHAIN-x86_64-pc-windows-gnu" ;; esac;
-        # * use requested TOOLCHAIN if specified
-        if [ -n "${{ matrix.job.toolchain }}" ]; then TOOLCHAIN="${{ matrix.job.toolchain }}" ; fi
-        outputs TOOLCHAIN
-        # target-specific options
-        # * CODECOV_FLAGS
-        CODECOV_FLAGS=$( echo "${{ matrix.job.os }}" | sed 's/[^[:alnum:]]/_/g' )
-        outputs CODECOV_FLAGS
+      - uses: actions/checkout@v4
+      - name: Initialize workflow variables
+        id: vars
+        shell: bash
+        run: |
+          ## VARs setup
+          outputs() { step_id="vars"; for var in "$@" ; do echo steps.${step_id}.outputs.${var}="${!var}"; echo "${var}=${!var}" >> $GITHUB_OUTPUT; done; }
+          # toolchain
+          TOOLCHAIN="nightly" ## default to "nightly" toolchain (required for certain required unstable compiler flags) ## !maint: refactor when stable channel has needed support
+          # * specify gnu-type TOOLCHAIN for windows; `grcov` requires gnu-style code coverage data files
+          case ${{ matrix.job.os }} in windows-*) TOOLCHAIN="$TOOLCHAIN-x86_64-pc-windows-gnu" ;; esac;
+          # * use requested TOOLCHAIN if specified
+          if [ -n "${{ matrix.job.toolchain }}" ]; then TOOLCHAIN="${{ matrix.job.toolchain }}" ; fi
+          outputs TOOLCHAIN
+          # target-specific options
+          # * CODECOV_FLAGS
+          CODECOV_FLAGS=$( echo "${{ matrix.job.os }}" | sed 's/[^[:alnum:]]/_/g' )
+          outputs CODECOV_FLAGS
 
-    - name: rust toolchain ~ install
-      uses: dtolnay/rust-toolchain@nightly
-    - name: Install llvm-tools-preview
-      run: rustup component add llvm-tools-preview
-    - name: Test
-      run: cargo test --no-fail-fast
-      env:
-        CARGO_INCREMENTAL: "0"
-        RUSTC_WRAPPER: ""
-        RUSTFLAGS: "-Cinstrument-coverage -Zcoverage-options=branch -Ccodegen-units=1 -Copt-level=0 -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort"
-        RUSTDOCFLAGS: "-Cpanic=abort"
-        LLVM_PROFILE_FILE: "util-linux-%p-%m.profraw"
-    - name: "`grcov` ~ install"
-      id: build_grcov
-      shell: bash
-      run: |
-        git clone https://github.com/mozilla/grcov.git ~/grcov/
-        cd ~/grcov
-        # Hardcode the version of crossbeam-epoch. See
-        # https://github.com/uutils/coreutils/issues/3680
-        sed -i -e "s|tempfile =|crossbeam-epoch = \"=0.9.8\"\ntempfile =|" Cargo.toml
-        cargo install --path .
-        cd -
-# Uncomment when the upstream issue
-# https://github.com/mozilla/grcov/issues/849 is fixed
-#      uses: actions-rs/install@v0.1
-#      with:
-#        crate: grcov
-#        version: latest
-#        use-tool-cache: false
-    - name: Generate coverage data (via `grcov`)
-      id: coverage
-      shell: bash
-      run: |
-        ## Generate coverage data
-        COVERAGE_REPORT_DIR="target/debug"
-        COVERAGE_REPORT_FILE="${COVERAGE_REPORT_DIR}/lcov.info"
-        mkdir -p "${COVERAGE_REPORT_DIR}"
-        # display coverage files
-        grcov . --binary-path="${COVERAGE_REPORT_DIR}" --output-type files --ignore build.rs --ignore "vendor/*" --ignore "/*" --ignore "[a-zA-Z]:/*" --excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()" | sort --unique
-        # generate coverage report
-        grcov . --binary-path="${COVERAGE_REPORT_DIR}" --output-type lcov --output-path "${COVERAGE_REPORT_FILE}" --branch --ignore build.rs --ignore "vendor/*" --ignore "/*" --ignore "[a-zA-Z]:/*" --excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()"
-        echo "report=${COVERAGE_REPORT_FILE}" >> $GITHUB_OUTPUT
-    - name: Upload coverage results (to Codecov.io)
-      uses: codecov/codecov-action@v5
-      with:
-        token: ${{ secrets.CODECOV_TOKEN }}
-        files: ${{ steps.coverage.outputs.report }}
-        ## flags: IntegrationTests, UnitTests, ${{ steps.vars.outputs.CODECOV_FLAGS }}
-        flags: ${{ steps.vars.outputs.CODECOV_FLAGS }}
-        name: codecov-umbrella
-        fail_ci_if_error: false
-
+      - name: rust toolchain ~ install
+        uses: dtolnay/rust-toolchain@nightly
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+      - name: Test
+        run: cargo test --no-fail-fast
+        env:
+          CARGO_INCREMENTAL: "0"
+          RUSTC_WRAPPER: ""
+          RUSTFLAGS: "-Cinstrument-coverage -Zcoverage-options=branch -Ccodegen-units=1 -Copt-level=0 -Coverflow-checks=off -Zpanic_abort_tests -Cpanic=abort"
+          RUSTDOCFLAGS: "-Cpanic=abort"
+          LLVM_PROFILE_FILE: "util-linux-%p-%m.profraw"
+      - name: "`grcov` ~ install"
+        id: build_grcov
+        shell: bash
+        run: |
+          git clone https://github.com/mozilla/grcov.git ~/grcov/
+          cd ~/grcov
+          # Hardcode the version of crossbeam-epoch. See
+          # https://github.com/uutils/coreutils/issues/3680
+          sed -i -e "s|tempfile =|crossbeam-epoch = \"=0.9.8\"\ntempfile =|" Cargo.toml
+          cargo install --path .
+          cd -
+      # Uncomment when the upstream issue
+      # https://github.com/mozilla/grcov/issues/849 is fixed
+      #      uses: actions-rs/install@v0.1
+      #      with:
+      #        crate: grcov
+      #        version: latest
+      #        use-tool-cache: false
+      - name: Generate coverage data (via `grcov`)
+        id: coverage
+        shell: bash
+        run: |
+          ## Generate coverage data
+          COVERAGE_REPORT_DIR="target/debug"
+          COVERAGE_REPORT_FILE="${COVERAGE_REPORT_DIR}/lcov.info"
+          mkdir -p "${COVERAGE_REPORT_DIR}"
+          # display coverage files
+          grcov . --binary-path="${COVERAGE_REPORT_DIR}" --output-type files --ignore build.rs --ignore "vendor/*" --ignore "/*" --ignore "[a-zA-Z]:/*" --excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()" | sort --unique
+          # generate coverage report
+          grcov . --binary-path="${COVERAGE_REPORT_DIR}" --output-type lcov --output-path "${COVERAGE_REPORT_FILE}" --branch --ignore build.rs --ignore "vendor/*" --ignore "/*" --ignore "[a-zA-Z]:/*" --excl-br-line "^\s*((debug_)?assert(_eq|_ne)?!|#\[derive\()"
+          echo "report=${COVERAGE_REPORT_FILE}" >> $GITHUB_OUTPUT
+      - name: Upload coverage results (to Codecov.io)
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ${{ steps.coverage.outputs.report }}
+          ## flags: IntegrationTests, UnitTests, ${{ steps.vars.outputs.CODECOV_FLAGS }}
+          flags: ${{ steps.vars.outputs.CODECOV_FLAGS }}
+          name: codecov-umbrella
+          fail_ci_if_error: false
